@@ -1,0 +1,102 @@
+# ==============================================================================
+# GSEA (Gene Set Enrichment Analysis) Pipeline: GO, KEGG, and Reactome
+# ==============================================================================
+
+# 1. ENVIRONMENT AND LIBRARIES
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, clusterProfiler, org.Hs.eg.db, ReactomePA, enrichplot)
+
+# 2. CONFIGURATION
+# Set working directory to input location or specify relative/absolute path
+input_dir  <- "./data/GSE126352" 
+output_dir <- file.path(input_dir, "GSEA_Global_Results")
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# 3. MAIN GSEA FUNCTION
+run_gsea_analysis <- function(file_path) {
+  base_name <- tools::file_path_sans_ext(basename(file_path))
+  message(paste("\n>>> Starting GSEA:", base_name))
+  
+  # A. Data Loading and Cleaning
+  # Filter missing values for gene symbols, p-values, and logFC
+  df <- read.csv(file_path, check.names = FALSE) %>%
+    filter(!is.na(Symbols) & Symbols != "" & !is.na(P.Value) & !is.na(logFC))
+  
+  # B. Ranking Calculation
+  # Ranking metric: -log10(P.Value) * sign(logFC)
+  df_rank <- df %>%
+    mutate(
+      p_adj_for_log = ifelse(P.Value == 0, 1e-300, P.Value),
+      rank_metric = -log10(p_adj_for_log) * sign(logFC)
+    ) %>%
+    arrange(desc(rank_metric))
+  
+  # Create named vector for GO (Gene Symbols)
+  gene_list_symbol <- df_rank$rank_metric
+  names(gene_list_symbol) <- df_rank$Symbols
+  gene_list_symbol <- sort(gene_list_symbol[!duplicated(names(gene_list_symbol))], decreasing = TRUE)
+  
+  # Create named vector for KEGG/Reactome (EntrezIDs)
+  df_entrez <- df_rank %>% filter(!is.na(EntrezID))
+  gene_list_entrez <- df_entrez$rank_metric
+  names(gene_list_entrez) <- as.character(df_entrez$EntrezID)
+  gene_list_entrez <- sort(gene_list_entrez[!duplicated(names(gene_list_entrez))], decreasing = TRUE)
+  
+  # C. Pathway Enrichment Analysis
+  
+  # --- 1. GSEA: Gene Ontology (GO) ---
+  message("Processing GO...")
+  gse_go <- gseGO(
+    geneList     = gene_list_symbol, 
+    OrgDb        = org.Hs.eg.db, 
+    keyType      = "SYMBOL",
+    ont          = "ALL", 
+    minGSSize    = 10, 
+    maxGSSize    = 500, 
+    pvalueCutoff = 0.05, 
+    verbose      = FALSE
+  )
+  
+  # --- 2. GSEA: KEGG ---
+  message("Processing KEGG...")
+  gse_kegg <- gseKEGG(
+    geneList     = gene_list_entrez, 
+    organism     = "hsa", 
+    pvalueCutoff = 0.05, 
+    minGSSize    = 10, 
+    verbose      = FALSE
+  )
+  if (!is.null(gse_kegg) && nrow(as.data.frame(gse_kegg)) > 0) {
+    gse_kegg <- setReadable(gse_kegg, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  }
+  
+  # --- 3. GSEA: REACTOME ---
+  message("Processing Reactome...")
+  gse_reactome <- gsePathway(
+    geneList     = gene_list_entrez, 
+    organism     = "human", 
+    pvalueCutoff = 0.05, 
+    minGSSize    = 10, 
+    verbose      = FALSE
+  )
+  if (!is.null(gse_reactome) && nrow(as.data.frame(gse_reactome)) > 0) {
+    gse_reactome <- setReadable(gse_reactome, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+  }
+  
+  # D. SAVE RESULTS
+  write.csv(as.data.frame(gse_go),       file.path(output_dir, paste0("GSEA_GO_", base_name, ".csv")))
+  write.csv(as.data.frame(gse_kegg),     file.path(output_dir, paste0("GSEA_KEGG_", base_name, ".csv")))
+  write.csv(as.data.frame(gse_reactome), file.path(output_dir, paste0("GSEA_Reactome_", base_name, ".csv")))
+  
+  # E. VISUALIZATION (Ridgeplot)
+  if (nrow(as.data.frame(gse_go)) > 0) {
+    p <- ridgeplot(gse_go, showCategory = 15) + labs(title = paste("GO -", base_name))
+    ggsave(file.path(output_dir, paste0("Ridgeplot_GO_", base_name, ".png")), p, width = 12, height = 10, dpi = 300)
+  }
+}
+
+# 4. EXECUTION
+all_files <- list.files(input_dir, pattern = "\\.csv$", full.names = TRUE)
+walk(all_files, run_gsea_analysis)
+
+message("\n>>> Global GSEA Pipeline completed successfully!")
